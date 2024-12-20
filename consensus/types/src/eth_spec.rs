@@ -439,7 +439,7 @@ impl EthSpec for MainnetEthSpec {
     type PendingDepositsLimit = U134217728;
     type PendingPartialWithdrawalsLimit = U134217728;
     type PendingConsolidationsLimit = U262144;
-    type MaxConsolidationRequestsPerPayload = U1;
+    type MaxConsolidationRequestsPerPayload = U2;
     type MaxDepositRequestsPerPayload = U8192;
     type MaxAttesterSlashingsElectra = U1;
     type MaxAttestationsElectra = U8;
@@ -568,7 +568,7 @@ impl EthSpec for GnosisEthSpec {
     type PendingDepositsLimit = U134217728;
     type PendingPartialWithdrawalsLimit = U134217728;
     type PendingConsolidationsLimit = U262144;
-    type MaxConsolidationRequestsPerPayload = U1;
+    type MaxConsolidationRequestsPerPayload = U2;
     type MaxDepositRequestsPerPayload = U8192;
     type MaxAttesterSlashingsElectra = U1;
     type MaxAttestationsElectra = U8;

@@ -746,8 +746,8 @@ pub fn process_consolidation_request<E: EthSpec>(
     }
 
     let target_validator = state.get_validator(target_index)?;
-    // Verify the target has execution withdrawal credentials
-    if !target_validator.has_execution_withdrawal_credential(spec) {
+    // Verify the target has compounding withdrawal credentials
+    if !target_validator.has_compounding_withdrawal_credential(spec) {
         return Ok(());
     }
 
@@ -791,10 +791,5 @@ pub fn process_consolidation_request<E: EthSpec>(
             target_index: target_index as u64,
         })?;
 
-    let target_validator = state.get_validator(target_index)?;
-    // Churn any target excess active balance of target and raise its max
-    if target_validator.has_eth1_withdrawal_credential(spec) {
-        state.switch_to_compounding_validator(target_index, spec)?;
-    }
     Ok(())
 }
