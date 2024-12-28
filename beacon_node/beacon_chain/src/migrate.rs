@@ -1,7 +1,8 @@
-use crate::beacon_chain::BEACON_CHAIN_DB_KEY;
 use crate::errors::BeaconChainError;
-use crate::head_tracker::{HeadTracker, SszHeadTracker};
-use crate::persisted_beacon_chain::{PersistedBeaconChain, DUMMY_CANONICAL_HEAD_BLOCK_ROOT};
+use crate::summaries_dag::{
+    BlockSummariesDAG, DAGBlockSummary, DAGStateSummaryV22, Error as SummariesDagError,
+    StateSummariesDAG,
+};
 use parking_lot::Mutex;
 use slog::{debug, error, info, warn, Logger};
 use std::collections::{HashMap, HashSet};
@@ -10,13 +11,9 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use store::hot_cold_store::{migrate_database, HotColdDBError};
-use store::iter::RootsIterator;
-use store::{Error, ItemStore, StoreItem, StoreOp};
+use store::{Error, ItemStore, StoreOp};
 pub use store::{HotColdDB, MemoryStore};
-use types::{
-    BeaconState, BeaconStateError, BeaconStateHash, Checkpoint, Epoch, EthSpec, FixedBytesExtended,
-    Hash256, SignedBeaconBlockHash, Slot,
-};
+use types::{BeaconState, BeaconStateHash, Checkpoint, Epoch, EthSpec, Hash256, Slot};
 
 /// Compact at least this frequently, finalization permitting (7 days).
 const MAX_COMPACTION_PERIOD_SECONDS: u64 = 604800;
@@ -42,8 +39,6 @@ pub struct BackgroundMigrator<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>>
     prev_migration: Arc<Mutex<PrevMigration>>,
     #[allow(clippy::type_complexity)]
     tx_thread: Option<Mutex<(mpsc::Sender<Notification>, thread::JoinHandle<()>)>>,
-    /// Genesis block root, for persisting the `PersistedBeaconChain`.
-    genesis_block_root: Hash256,
     log: Logger,
 }
 
@@ -90,7 +85,7 @@ pub struct PrevMigration {
 pub enum PruningOutcome {
     /// The pruning succeeded and updated the pruning checkpoint from `old_finalized_checkpoint`.
     Successful {
-        old_finalized_checkpoint: Checkpoint,
+        old_finalized_checkpoint_epoch: Epoch,
     },
     /// The run was aborted because the new finalized checkpoint is older than the previous one.
     OutOfOrderFinalization {
@@ -117,6 +112,11 @@ pub enum PruningError {
     },
     UnexpectedEqualStateRoots,
     UnexpectedUnequalStateRoots,
+    MissingSummaryForFinalizedCheckpoint(Hash256),
+    MissingBlindedBlock(Hash256),
+    SummariesDagError(SummariesDagError),
+    EmptyFinalizedStates,
+    EmptyFinalizedBlocks,
 }
 
 /// Message sent to the migration thread containing the information it needs to run.
@@ -129,19 +129,12 @@ pub enum Notification {
 pub struct FinalizationNotification {
     finalized_state_root: BeaconStateHash,
     finalized_checkpoint: Checkpoint,
-    head_tracker: Arc<HeadTracker>,
     prev_migration: Arc<Mutex<PrevMigration>>,
-    genesis_block_root: Hash256,
 }
 
 impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Hot, Cold> {
     /// Create a new `BackgroundMigrator` and spawn its thread if necessary.
-    pub fn new(
-        db: Arc<HotColdDB<E, Hot, Cold>>,
-        config: MigratorConfig,
-        genesis_block_root: Hash256,
-        log: Logger,
-    ) -> Self {
+    pub fn new(db: Arc<HotColdDB<E, Hot, Cold>>, config: MigratorConfig, log: Logger) -> Self {
         // Estimate last migration run from DB split slot.
         let prev_migration = Arc::new(Mutex::new(PrevMigration {
             epoch: db.get_split_slot().epoch(E::slots_per_epoch()),
@@ -156,7 +149,6 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
             db,
             tx_thread,
             prev_migration,
-            genesis_block_root,
             log,
         }
     }
@@ -170,14 +162,11 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
         &self,
         finalized_state_root: BeaconStateHash,
         finalized_checkpoint: Checkpoint,
-        head_tracker: Arc<HeadTracker>,
     ) -> Result<(), BeaconChainError> {
         let notif = FinalizationNotification {
             finalized_state_root,
             finalized_checkpoint,
-            head_tracker,
             prev_migration: self.prev_migration.clone(),
-            genesis_block_root: self.genesis_block_root,
         };
 
         // Send to background thread if configured, otherwise run in foreground.
@@ -333,45 +322,6 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
             }
         };
 
-        let old_finalized_checkpoint = match Self::prune_abandoned_forks(
-            db.clone(),
-            notif.head_tracker,
-            finalized_state_root,
-            &finalized_state,
-            notif.finalized_checkpoint,
-            notif.genesis_block_root,
-            log,
-        ) {
-            Ok(PruningOutcome::Successful {
-                old_finalized_checkpoint,
-            }) => old_finalized_checkpoint,
-            Ok(PruningOutcome::DeferredConcurrentHeadTrackerMutation) => {
-                warn!(
-                    log,
-                    "Pruning deferred because of a concurrent mutation";
-                    "message" => "this is expected only very rarely!"
-                );
-                return;
-            }
-            Ok(PruningOutcome::OutOfOrderFinalization {
-                old_finalized_checkpoint,
-                new_finalized_checkpoint,
-            }) => {
-                warn!(
-                    log,
-                    "Ignoring out of order finalization request";
-                    "old_finalized_epoch" => old_finalized_checkpoint.epoch,
-                    "new_finalized_epoch" => new_finalized_checkpoint.epoch,
-                    "message" => "this is expected occasionally due to a (harmless) race condition"
-                );
-                return;
-            }
-            Err(e) => {
-                warn!(log, "Block pruning failed"; "error" => ?e);
-                return;
-            }
-        };
-
         match migrate_database(
             db.clone(),
             finalized_state_root.into(),
@@ -396,10 +346,47 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
             }
         };
 
+        let old_finalized_checkpoint_epoch = match Self::prune_hot_db(
+            db.clone(),
+            finalized_state_root.into(),
+            &finalized_state,
+            notif.finalized_checkpoint,
+            log,
+        ) {
+            Ok(PruningOutcome::Successful {
+                old_finalized_checkpoint_epoch,
+            }) => old_finalized_checkpoint_epoch,
+            Ok(PruningOutcome::DeferredConcurrentHeadTrackerMutation) => {
+                warn!(
+                    log,
+                    "Pruning deferred because of a concurrent mutation";
+                    "message" => "this is expected only very rarely!"
+                );
+                return;
+            }
+            Ok(PruningOutcome::OutOfOrderFinalization {
+                old_finalized_checkpoint,
+                new_finalized_checkpoint,
+            }) => {
+                warn!(
+                    log,
+                    "Ignoring out of order finalization request";
+                    "old_finalized_epoch" => old_finalized_checkpoint.epoch,
+                    "new_finalized_epoch" => new_finalized_checkpoint.epoch,
+                    "message" => "this is expected occasionally due to a (harmless) race condition"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(log, "Hot DB pruning failed"; "error" => ?e);
+                return;
+            }
+        };
+
         // Finally, compact the database so that new free space is properly reclaimed.
         if let Err(e) = Self::run_compaction(
             db,
-            old_finalized_checkpoint.epoch,
+            old_finalized_checkpoint_epoch,
             notif.finalized_checkpoint.epoch,
             log,
         ) {
@@ -468,31 +455,17 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
     /// Traverses live heads and prunes blocks and states of chains that we know can't be built
     /// upon because finalization would prohibit it. This is an optimisation intended to save disk
     /// space.
-    #[allow(clippy::too_many_arguments)]
-    fn prune_abandoned_forks(
+    fn prune_hot_db(
         store: Arc<HotColdDB<E, Hot, Cold>>,
-        head_tracker: Arc<HeadTracker>,
-        new_finalized_state_hash: BeaconStateHash,
+        new_finalized_state_hash: Hash256,
         new_finalized_state: &BeaconState<E>,
         new_finalized_checkpoint: Checkpoint,
-        genesis_block_root: Hash256,
         log: &Logger,
     ) -> Result<PruningOutcome, BeaconChainError> {
-        let old_finalized_checkpoint =
-            store
-                .load_pruning_checkpoint()?
-                .unwrap_or_else(|| Checkpoint {
-                    epoch: Epoch::new(0),
-                    root: Hash256::zero(),
-                });
-
-        let old_finalized_slot = old_finalized_checkpoint
-            .epoch
-            .start_slot(E::slots_per_epoch());
+        let split_state_root = store.get_split_info().state_root;
         let new_finalized_slot = new_finalized_checkpoint
             .epoch
             .start_slot(E::slots_per_epoch());
-        let new_finalized_block_hash = new_finalized_checkpoint.root.into();
 
         // The finalized state must be for the epoch boundary slot, not the slot of the finalized
         // block.
@@ -504,205 +477,190 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
             .into());
         }
 
-        // The new finalized state must be newer than the previous finalized state.
-        // I think this can happen sometimes currently due to `fork_choice` running in parallel
-        // with itself and sending us notifications out of order.
-        if old_finalized_slot > new_finalized_slot {
-            return Ok(PruningOutcome::OutOfOrderFinalization {
-                old_finalized_checkpoint,
-                new_finalized_checkpoint,
-            });
-        }
+        // TODO(hdiff): if we remove the check of `old_finalized_slot > new_finalized_slot` can we
+        // ensure that a single pruning operation is running at once? If a pruning run is triggered
+        // with an old finalized checkpoint it can derive a stale hdiff set of slots and delete
+        // future ones that are necessary breaking the DB.
 
         debug!(
             log,
             "Starting database pruning";
-            "old_finalized_epoch" => old_finalized_checkpoint.epoch,
-            "new_finalized_epoch" => new_finalized_checkpoint.epoch,
+            "new_finalized_checkpoint" => ?new_finalized_checkpoint,
+            "new_finalized_state_hash" => ?new_finalized_state_hash,
         );
-        // For each slot between the new finalized checkpoint and the old finalized checkpoint,
-        // collect the beacon block root and state root of the canonical chain.
-        let newly_finalized_chain: HashMap<Slot, (SignedBeaconBlockHash, BeaconStateHash)> =
-            std::iter::once(Ok((
-                new_finalized_slot,
-                (new_finalized_block_hash, new_finalized_state_hash),
-            )))
-            .chain(RootsIterator::new(&store, new_finalized_state).map(|res| {
-                res.map(|(block_root, state_root, slot)| {
-                    (slot, (block_root.into(), state_root.into()))
+
+        let (state_summaries_dag, block_summaries_dag) = {
+            let state_summaries = store
+                .load_hot_state_summaries()?
+                .into_iter()
+                .map(|(state_root, summary)| (state_root, summary.into()))
+                .collect::<Vec<(Hash256, DAGStateSummaryV22)>>();
+
+            // De-duplicate block roots to reduce block reads below
+            let summary_block_roots = HashSet::<Hash256>::from_iter(
+                state_summaries
+                    .iter()
+                    .map(|(_, summary)| summary.latest_block_root),
+            );
+
+            // Sanity check, there is at least one summary with the new finalized block root
+            if !summary_block_roots.contains(&new_finalized_checkpoint.root) {
+                return Err(BeaconChainError::PruningError(
+                    PruningError::MissingSummaryForFinalizedCheckpoint(
+                        new_finalized_checkpoint.root,
+                    ),
+                ));
+            }
+
+            let blocks = summary_block_roots
+                .iter()
+                .map(|block_root| {
+                    let block = store
+                        .get_blinded_block(block_root)?
+                        .ok_or(PruningError::MissingBlindedBlock(*block_root))?;
+                    Ok((
+                        *block_root,
+                        DAGBlockSummary {
+                            slot: block.slot(),
+                            parent_root: block.parent_root(),
+                        },
+                    ))
                 })
-            }))
-            .take_while(|res| {
-                res.as_ref()
-                    .map_or(true, |(slot, _)| *slot >= old_finalized_slot)
-            })
-            .collect::<Result<_, _>>()?;
+                .collect::<Result<Vec<_>, BeaconChainError>>()?;
+
+            let parent_block_roots = blocks
+                .iter()
+                .map(|(block_root, block)| (*block_root, block.parent_root))
+                .collect::<HashMap<Hash256, Hash256>>();
+
+            (
+                StateSummariesDAG::new_from_v22(
+                    state_summaries,
+                    parent_block_roots,
+                    split_state_root,
+                )
+                .map_err(PruningError::SummariesDagError)?,
+                BlockSummariesDAG::new(&blocks),
+            )
+        };
+
+        // From the DAG compute the list of roots that descend from finalized root up to the
+        // split slot.
+
+        let finalized_and_descendant_block_roots = HashSet::<Hash256>::from_iter(
+            std::iter::once(new_finalized_checkpoint.root).chain(
+                // Note: The sanity check above for existance of at least one summary with
+                // new_finalized_checkpoint.root should ensure that this call never errors
+                block_summaries_dag
+                    .descendant_block_roots_of(&new_finalized_checkpoint.root)
+                    .map_err(PruningError::SummariesDagError)?,
+            ),
+        );
+
+        // Note: ancestors_of includes the finalized state root
+        let newly_finalized_state_summaries = state_summaries_dag
+            .ancestors_of(new_finalized_state_hash)
+            .map_err(PruningError::SummariesDagError)?;
+        let newly_finalized_state_roots = newly_finalized_state_summaries
+            .iter()
+            .map(|(root, _)| *root)
+            .collect::<HashSet<Hash256>>();
+        let newly_finalized_states_min_slot = *newly_finalized_state_summaries
+            .iter()
+            .map(|(_, slot)| slot)
+            .min()
+            .ok_or(PruningError::EmptyFinalizedStates)?;
+
+        // Note: ancestors_of includes the finalized block
+        let newly_finalized_blocks = block_summaries_dag
+            .ancestors_of(new_finalized_checkpoint.root)
+            .map_err(PruningError::SummariesDagError)?;
+        let newly_finalized_block_roots = newly_finalized_blocks
+            .iter()
+            .map(|(root, _)| *root)
+            .collect::<HashSet<Hash256>>();
+        let newly_finalized_blocks_min_slot = *newly_finalized_blocks
+            .iter()
+            .map(|(_, slot)| slot)
+            .min()
+            .ok_or(PruningError::EmptyFinalizedBlocks)?;
 
         // We don't know which blocks are shared among abandoned chains, so we buffer and delete
         // everything in one fell swoop.
-        let mut abandoned_blocks: HashSet<SignedBeaconBlockHash> = HashSet::new();
-        let mut abandoned_states: HashSet<(Slot, BeaconStateHash)> = HashSet::new();
-        let mut abandoned_heads: HashSet<Hash256> = HashSet::new();
+        let mut blocks_to_prune: HashSet<Hash256> = HashSet::new();
+        let mut states_to_prune: HashSet<(Slot, Hash256)> = HashSet::new();
 
-        let heads = head_tracker.heads();
+        for (slot, summaries) in state_summaries_dag.summaries_by_slot_ascending() {
+            for (state_root, summary) in summaries {
+                let should_prune =
+                    if finalized_and_descendant_block_roots.contains(&summary.latest_block_root) {
+                        // Keep this state is the post state of a viable head, or a state advance from a
+                        // viable head.
+                        false
+                    } else {
+                        // Everything else, prune
+                        true
+                    };
+
+                if should_prune {
+                    // States are migrated into the cold DB in the migrate step. All hot states
+                    // prior to finalized can be pruned from the hot DB columns
+                    states_to_prune.insert((slot, state_root));
+                }
+            }
+        }
+
+        for (block_root, slot) in block_summaries_dag.iter() {
+            // Blocks both finalized and unfinalized are in the same DB column. We must only
+            // prune blocks from abandoned forks. Deriving block pruning from state
+            // summaries is tricky since now we keep some hot state summaries beyond
+            // finalization. We will only prune blocks that still have an associated hot
+            // state summary, are above prior finalization and not in the canonical chain.
+            let should_prune = if finalized_and_descendant_block_roots.contains(&block_root) {
+                // Keep unfinalized blocks descendant of finalized + finalized block itself
+                false
+            } else if newly_finalized_block_roots.contains(&block_root) {
+                // Keep recently finalized blocks
+                false
+            } else if slot < newly_finalized_blocks_min_slot
+                || newly_finalized_block_roots.contains(&block_root)
+            {
+                // Keep recently finalized blocks that we know are canonical. Blocks with slots <
+                // that `newly_finalized_blocks_min_slot` we don't have canonical information so we
+                // assume they are part of the finalized pruned chain
+                //
+                // Pruning those risks breaking the DB by deleting canonical blocks once the HDiff
+                // grid advances. If the pruning routine is correct this condition should never hit.
+                false
+            } else {
+                // Everything else, prune
+                true
+            };
+
+            if should_prune {
+                blocks_to_prune.insert(block_root);
+            }
+        }
+
         debug!(
             log,
             "Extra pruning information";
-            "old_finalized_root" => format!("{:?}", old_finalized_checkpoint.root),
-            "new_finalized_root" => format!("{:?}", new_finalized_checkpoint.root),
-            "head_count" => heads.len(),
+            "new_finalized_checkpoint" => ?new_finalized_checkpoint,
+            "newly_finalized_blocks" => newly_finalized_blocks.len(),
+            "newly_finalized_blocks_min_slot" => newly_finalized_blocks_min_slot,
+            "newly_finalized_state_roots" => newly_finalized_state_roots.len(),
+            "newly_finalized_states_min_slot" => newly_finalized_states_min_slot,
+            "state_summaries_count" => state_summaries_dag.summaries_count(),
+            "finalized_and_descendant_block_roots" => finalized_and_descendant_block_roots.len(),
+            "blocks_to_prune_count" => blocks_to_prune.len(),
+            "states_to_prune_count" => states_to_prune.len(),
+            "blocks_to_prune" => ?blocks_to_prune,
+            "states_to_prune" => ?states_to_prune,
         );
 
-        for (head_hash, head_slot) in heads {
-            // Load head block. If it fails with a decode error, it's likely a reverted block,
-            // so delete it from the head tracker but leave it and its states in the database
-            // This is suboptimal as it wastes disk space, but it's difficult to fix. A re-sync
-            // can be used to reclaim the space.
-            let head_state_root = match store.get_blinded_block(&head_hash) {
-                Ok(Some(block)) => block.state_root(),
-                Ok(None) => {
-                    return Err(BeaconStateError::MissingBeaconBlock(head_hash.into()).into())
-                }
-                Err(Error::SszDecodeError(e)) => {
-                    warn!(
-                        log,
-                        "Forgetting invalid head block";
-                        "block_root" => ?head_hash,
-                        "error" => ?e,
-                    );
-                    abandoned_heads.insert(head_hash);
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-            let mut potentially_abandoned_head = Some(head_hash);
-            let mut potentially_abandoned_blocks = vec![];
-
-            // Iterate backwards from this head, staging blocks and states for deletion.
-            let iter = std::iter::once(Ok((head_hash, head_state_root, head_slot)))
-                .chain(RootsIterator::from_block(&store, head_hash)?);
-
-            for maybe_tuple in iter {
-                let (block_root, state_root, slot) = maybe_tuple?;
-                let block_root = SignedBeaconBlockHash::from(block_root);
-                let state_root = BeaconStateHash::from(state_root);
-
-                match newly_finalized_chain.get(&slot) {
-                    // If there's no information about a slot on the finalized chain, then
-                    // it should be because it's ahead of the new finalized slot. Stage
-                    // the fork's block and state for possible deletion.
-                    None => {
-                        if slot > new_finalized_slot {
-                            potentially_abandoned_blocks.push((
-                                slot,
-                                Some(block_root),
-                                Some(state_root),
-                            ));
-                        } else if slot >= old_finalized_slot {
-                            return Err(PruningError::MissingInfoForCanonicalChain { slot }.into());
-                        } else {
-                            // We must assume here any candidate chains include the old finalized
-                            // checkpoint, i.e. there aren't any forks starting at a block that is a
-                            // strict ancestor of old_finalized_checkpoint.
-                            warn!(
-                                log,
-                                "Found a chain that should already have been pruned";
-                                "head_block_root" => format!("{:?}", head_hash),
-                                "head_slot" => head_slot,
-                            );
-                            potentially_abandoned_head.take();
-                            break;
-                        }
-                    }
-                    Some((finalized_block_root, finalized_state_root)) => {
-                        // This fork descends from a newly finalized block, we can stop.
-                        if block_root == *finalized_block_root {
-                            // Sanity check: if the slot and block root match, then the
-                            // state roots should match too.
-                            if state_root != *finalized_state_root {
-                                return Err(PruningError::UnexpectedUnequalStateRoots.into());
-                            }
-
-                            // If the fork descends from the whole finalized chain,
-                            // do not prune it. Otherwise continue to delete all
-                            // of the blocks and states that have been staged for
-                            // deletion so far.
-                            if slot == new_finalized_slot {
-                                potentially_abandoned_blocks.clear();
-                                potentially_abandoned_head.take();
-                            }
-                            // If there are skipped slots on the fork to be pruned, then
-                            // we will have just staged the common block for deletion.
-                            // Unstage it.
-                            else {
-                                for (_, block_root, _) in
-                                    potentially_abandoned_blocks.iter_mut().rev()
-                                {
-                                    if block_root.as_ref() == Some(finalized_block_root) {
-                                        *block_root = None;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                            break;
-                        } else {
-                            if state_root == *finalized_state_root {
-                                return Err(PruningError::UnexpectedEqualStateRoots.into());
-                            }
-                            potentially_abandoned_blocks.push((
-                                slot,
-                                Some(block_root),
-                                Some(state_root),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            if let Some(abandoned_head) = potentially_abandoned_head {
-                debug!(
-                    log,
-                    "Pruning head";
-                    "head_block_root" => format!("{:?}", abandoned_head),
-                    "head_slot" => head_slot,
-                );
-                abandoned_heads.insert(abandoned_head);
-                abandoned_blocks.extend(
-                    potentially_abandoned_blocks
-                        .iter()
-                        .filter_map(|(_, maybe_block_hash, _)| *maybe_block_hash),
-                );
-                abandoned_states.extend(potentially_abandoned_blocks.iter().filter_map(
-                    |(slot, _, maybe_state_hash)| maybe_state_hash.map(|sr| (*slot, sr)),
-                ));
-            }
-        }
-
-        // Update the head tracker before the database, so that we maintain the invariant
-        // that a block present in the head tracker is present in the database.
-        // See https://github.com/sigp/lighthouse/issues/1557
-        let mut head_tracker_lock = head_tracker.0.write();
-
-        // Check that all the heads to be deleted are still present. The absence of any
-        // head indicates a race, that will likely resolve itself, so we defer pruning until
-        // later.
-        for head_hash in &abandoned_heads {
-            if !head_tracker_lock.contains_key(head_hash) {
-                return Ok(PruningOutcome::DeferredConcurrentHeadTrackerMutation);
-            }
-        }
-
-        // Then remove them for real.
-        for head_hash in abandoned_heads {
-            head_tracker_lock.remove(&head_hash);
-        }
-
-        let mut batch: Vec<StoreOp<E>> = abandoned_blocks
+        let mut batch: Vec<StoreOp<E>> = blocks_to_prune
             .into_iter()
-            .map(Into::into)
-            .flat_map(|block_root: Hash256| {
+            .flat_map(|block_root| {
                 [
                     StoreOp::DeleteBlock(block_root),
                     StoreOp::DeleteExecutionPayload(block_root),
@@ -710,41 +668,82 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
                     StoreOp::DeleteSyncCommitteeBranch(block_root),
                 ]
             })
-            .chain(
-                abandoned_states
-                    .into_iter()
-                    .map(|(slot, state_hash)| StoreOp::DeleteState(state_hash.into(), Some(slot))),
-            )
+            .chain(states_to_prune.into_iter().flat_map(|(slot, state_hash)| {
+                // Hot state diffs necessary for the HDiff grid are never added to `states_to_prune`
+                [StoreOp::DeleteState(state_hash, Some(slot))]
+            }))
             .collect();
 
-        // Persist the head in case the process is killed or crashes here. This prevents
-        // the head tracker reverting after our mutation above.
-        let persisted_head = PersistedBeaconChain {
-            _canonical_head_block_root: DUMMY_CANONICAL_HEAD_BLOCK_ROOT,
-            genesis_block_root,
-            ssz_head_tracker: SszHeadTracker::from_map(&head_tracker_lock),
-        };
-        drop(head_tracker_lock);
-        batch.push(StoreOp::KeyValueOp(
-            persisted_head.as_kv_store_op(BEACON_CHAIN_DB_KEY),
-        ));
-
-        // Persist the new finalized checkpoint as the pruning checkpoint.
-        batch.push(StoreOp::KeyValueOp(
-            store.pruning_checkpoint_store_op(new_finalized_checkpoint),
-        ));
+        // Prune sync committee branches of non-checkpoint canonical finalized blocks
+        Self::prune_non_checkpoint_sync_committee_branches(&newly_finalized_blocks, &mut batch);
+        // Prune all payloads of the canonical finalized blocks
+        if store.get_config().prune_payloads {
+            Self::prune_finalized_payloads(&newly_finalized_blocks, &mut batch);
+        }
 
         store.do_atomically_with_block_and_blobs_cache(batch)?;
-
-        // Do a quick separate pass to delete obsoleted hot states, usually pre-states from the state
-        // advance which are not canonical due to blocks being applied on top.
-        store.prune_old_hot_states()?;
 
         debug!(log, "Database pruning complete");
 
         Ok(PruningOutcome::Successful {
-            old_finalized_checkpoint,
+            // TODO(hdiff): approximation of the previous finalized checkpoint. Only used in the
+            // compaction to compute time, can we use something else?
+            old_finalized_checkpoint_epoch: newly_finalized_blocks_min_slot
+                .epoch(E::slots_per_epoch()),
         })
+    }
+
+    fn prune_finalized_payloads(
+        finalized_blocks: &[(Hash256, Slot)],
+        hot_db_ops: &mut Vec<StoreOp<E>>,
+    ) {
+        for (block_root, _) in finalized_blocks {
+            // Delete the execution payload if payload pruning is enabled. At a skipped slot we may
+            // delete the payload for the finalized block itself, but that's OK as we only guarantee
+            // that payloads are present for slots >= the split slot. The payload fetching code is also
+            // forgiving of missing payloads.
+            hot_db_ops.push(StoreOp::DeleteExecutionPayload(*block_root));
+        }
+    }
+
+    fn prune_non_checkpoint_sync_committee_branches(
+        finalized_blocks_desc: &[(Hash256, Slot)],
+        hot_db_ops: &mut Vec<StoreOp<E>>,
+    ) {
+        let mut epoch_boundary_blocks = HashSet::new();
+        let mut non_checkpoint_block_roots = HashSet::new();
+
+        // Then, iterate states in slot ascending order, as they are stored wrt previous states.
+        for (block_root, slot) in finalized_blocks_desc.iter().rev() {
+            // At a missed slot, `state_root_iter` will return the block root
+            // from the previous non-missed slot. This ensures that the block root at an
+            // epoch boundary is always a checkpoint block root. We keep track of block roots
+            // at epoch boundaries by storing them in the `epoch_boundary_blocks` hash set.
+            // We then ensure that block roots at the epoch boundary aren't included in the
+            // `non_checkpoint_block_roots` hash set.
+            if *slot % E::slots_per_epoch() == 0 {
+                epoch_boundary_blocks.insert(block_root);
+            } else {
+                non_checkpoint_block_roots.insert(block_root);
+            }
+
+            if epoch_boundary_blocks.contains(&block_root) {
+                non_checkpoint_block_roots.remove(&block_root);
+            }
+        }
+
+        // Prune sync committee branch data for all non checkpoint block roots.
+        // Note that `non_checkpoint_block_roots` should only contain non checkpoint block roots
+        // as long as `finalized_state.slot()` is at an epoch boundary. If this were not the case
+        // we risk the chance of pruning a `sync_committee_branch` for a checkpoint block root.
+        // E.g. if `current_split_slot` = (Epoch A slot 0) and `finalized_state.slot()` = (Epoch C slot 31)
+        // and (Epoch D slot 0) is a skipped slot, we will have pruned a `sync_committee_branch`
+        // for a checkpoint block root.
+        non_checkpoint_block_roots
+            .into_iter()
+            .for_each(|block_root| {
+                hot_db_ops.push(StoreOp::DeleteSyncCommitteeBranch(*block_root));
+            });
     }
 
     /// Compact the database if it has been more than `COMPACTION_PERIOD_SECONDS` since it

@@ -2467,6 +2467,18 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> HotColdDB<E, Hot, Cold> 
         self.hot_db.get(state_root)
     }
 
+    /// Load all hot state summaries present in the hot DB
+    pub fn load_hot_state_summaries(&self) -> Result<Vec<(Hash256, HotStateSummary)>, Error> {
+        self.hot_db
+            .iter_column::<Hash256>(DBColumn::BeaconStateSummary)
+            .map(|res| {
+                let (state_root, value) = res?;
+                let summary = HotStateSummary::from_ssz_bytes(&value)?;
+                Ok((state_root, summary))
+            })
+            .collect()
+    }
+
     /// Load the temporary flag for a state root, if one exists.
     ///
     /// Returns `Some` if the state is temporary, or `None` if the state is permanent or does not

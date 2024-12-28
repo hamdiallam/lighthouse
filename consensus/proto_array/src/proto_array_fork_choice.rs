@@ -885,6 +885,11 @@ impl ProtoArrayForkChoice {
     pub fn core_proto_array_mut(&mut self) -> &mut ProtoArray {
         &mut self.proto_array
     }
+
+    /// Returns all nodes that have zero children and are viable heads
+    pub fn viable_heads<E: EthSpec>(&self, current_slot: Slot) -> Vec<&ProtoNode> {
+        self.proto_array.viable_heads::<E>(current_slot)
+    }
 }
 
 /// Returns a list of `deltas`, where there is one delta for each of the indices in

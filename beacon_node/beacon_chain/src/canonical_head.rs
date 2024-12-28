@@ -992,7 +992,6 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         self.store_migrator.process_finalization(
             new_finalized_state_root.into(),
             new_view.finalized_checkpoint,
-            self.head_tracker.clone(),
         )?;
 
         // Prune blobs in the background.

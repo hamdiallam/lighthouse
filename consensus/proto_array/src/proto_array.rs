@@ -1041,6 +1041,37 @@ impl ProtoArray {
             })
             .map(|node| node.root)
     }
+
+    /// Returns all nodes that have zero children and are viable heads
+    pub fn viable_heads<E: EthSpec>(&self, current_slot: Slot) -> Vec<&ProtoNode> {
+        self.nodes_without_children()
+            .into_iter()
+            .filter_map(|index| {
+                // An unknown index is not a viable head
+                if let Some(node) = self.nodes.get(index) {
+                    if self.node_is_viable_for_head::<E>(node, current_slot) {
+                        return Some(node);
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+
+    /// Returns all node indices that have zero children. May include unviable nodes.
+    fn nodes_without_children(&self) -> Vec<usize> {
+        let mut childs_of = HashMap::<_, Vec<_>>::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            if let Some(parent_index) = node.parent {
+                childs_of.entry(parent_index).or_default().push(index);
+            }
+        }
+        childs_of
+            .into_iter()
+            .filter(|(_, childs)| childs.is_empty())
+            .map(|(index, _)| index)
+            .collect()
+    }
 }
 
 /// A helper method to calculate the proposer boost based on the given `justified_balances`.
